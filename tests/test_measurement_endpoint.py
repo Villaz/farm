@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from api.main import app, get_db
+from tests.conftest import create_schema
 
 SENSOR_ID = "sensor-uuid-1"
 COW_ID = "cow-uuid-1"
@@ -28,54 +28,13 @@ VALID_PAYLOAD = {
 def db_path(tmp_path: Path) -> Path:
     """Crea el esquema completo (cow, sensor, measurement) con datos de referencia."""
     path = tmp_path / "test.db"
+    create_schema(path)
     con = sqlite3.connect(path)
-    con.execute("""
-        CREATE TABLE cow (
-            id        TEXT PRIMARY KEY,
-            name      TEXT NOT NULL,
-            birthdate TEXT NOT NULL
-        )
-    """)
-    con.execute("""
-        CREATE TABLE sensor (
-            id   TEXT PRIMARY KEY,
-            unit TEXT NOT NULL
-        )
-    """)
-    con.execute("""
-        CREATE TABLE measurement (
-            sensor_id TEXT NOT NULL,
-            cow_id    TEXT NOT NULL,
-            timestamp TIMESTAMP NOT NULL,
-            value     REAL,
-            PRIMARY KEY (sensor_id, cow_id, timestamp),
-            FOREIGN KEY (sensor_id) REFERENCES sensor(id),
-            FOREIGN KEY (cow_id)    REFERENCES cow(id)
-        )
-    """)
-    # Datos de referencia necesarios para las FK
     con.execute("INSERT INTO cow VALUES (?, ?, ?)", (COW_ID, "Bessie #1", "2020-01-01"))
     con.execute("INSERT INTO sensor VALUES (?, ?)", (SENSOR_ID, "L"))
     con.commit()
     con.close()
     return path
-
-
-@pytest.fixture()
-def client(db_path: Path) -> TestClient:
-    """TestClient con get_db sustituido para usar la DB de test."""
-
-    def override_get_db():
-        con = sqlite3.connect(db_path, check_same_thread=False)
-        con.execute("PRAGMA foreign_keys = ON")
-        try:
-            yield con
-        finally:
-            con.close()
-
-    app.dependency_overrides[get_db] = override_get_db
-    yield TestClient(app)
-    app.dependency_overrides.clear()
 
 
 # ---------------------------------------------------------------------------

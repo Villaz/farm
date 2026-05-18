@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from api.main import app, get_db
+from tests.conftest import create_schema
 
 
 # ---------------------------------------------------------------------------
@@ -16,34 +16,10 @@ from api.main import app, get_db
 
 @pytest.fixture()
 def db_path(tmp_path: Path) -> Path:
-    """Crea el esquema de la tabla sensor en una DB temporal y devuelve su ruta."""
+    """Crea el esquema completo en una DB temporal y devuelve su ruta."""
     path = tmp_path / "test.db"
-    con = sqlite3.connect(path)
-    con.execute("""
-        CREATE TABLE sensor (-----------------------------Fotos 
-            id   TEXT PRIMARY KEY,
-            unit TEXT NOT NULL
-        )
-    """)
-    con.commit()
-    con.close()
+    create_schema(path)
     return path
-
-
-@pytest.fixture()
-def client(db_path: Path) -> TestClient:
-    """TestClient con get_db sustituido para usar la DB de test."""
-
-    def override_get_db():
-        con = sqlite3.connect(db_path, check_same_thread=False)
-        try:
-            yield con
-        finally:
-            con.close()
-
-    app.dependency_overrides[get_db] = override_get_db
-    yield TestClient(app)
-    app.dependency_overrides.clear()
 
 
 # ---------------------------------------------------------------------------

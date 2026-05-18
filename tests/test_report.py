@@ -15,32 +15,11 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from api.main import app, get_db
 from api.report import ReportGenerator
+from tests.conftest import create_schema
 
 TARGET_DATE = date(2024, 6, 15)
 TARGET_STR = TARGET_DATE.isoformat()
-
-_SCHEMA = """
-CREATE TABLE cow (
-    id        TEXT PRIMARY KEY,
-    name      TEXT NOT NULL,
-    birthdate TEXT NOT NULL
-);
-CREATE TABLE sensor (
-    id   TEXT PRIMARY KEY,
-    unit TEXT NOT NULL
-);
-CREATE TABLE measurement (
-    sensor_id TEXT      NOT NULL,
-    cow_id    TEXT      NOT NULL,
-    timestamp TIMESTAMP NOT NULL,
-    value     REAL,
-    PRIMARY KEY (sensor_id, cow_id, timestamp),
-    FOREIGN KEY (sensor_id) REFERENCES sensor(id),
-    FOREIGN KEY (cow_id)    REFERENCES cow(id)
-);
-"""
 
 
 def _dt(date_str: str, hour: int = 10) -> str:
@@ -50,8 +29,8 @@ def _dt(date_str: str, hour: int = 10) -> str:
 
 def _build_db(path: Path) -> None:
     """Populate the test DB with deterministic, date-fixed measurements."""
+    create_schema(path)
     con = sqlite3.connect(path)
-    con.executescript(_SCHEMA)
 
     con.executemany(
         "INSERT INTO cow VALUES (?, ?, '2020-01-01')",
@@ -162,21 +141,6 @@ def db_con(db_path: Path):
 @pytest.fixture()
 def generator() -> ReportGenerator:
     return ReportGenerator()
-
-
-@pytest.fixture()
-def client(db_path: Path) -> TestClient:
-    def override_get_db():
-        con = sqlite3.connect(db_path, check_same_thread=False)
-        con.execute("PRAGMA foreign_keys = ON")
-        try:
-            yield con
-        finally:
-            con.close()
-
-    app.dependency_overrides[get_db] = override_get_db
-    yield TestClient(app)
-    app.dependency_overrides.clear()
 
 
 # ---------------------------------------------------------------------------
