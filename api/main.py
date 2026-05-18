@@ -33,6 +33,11 @@ from api.validation import VALID_UNITS
 logger = logging.getLogger("fastapi")
 DB_PATH = Path(os.environ.get("DATABASE_URL", "../data/cows.db"))
 
+HEALTH_WINDOW_DAYS: int = 30
+HEALTH_RECENT_DAYS: int = 3
+MILK_DROP_THRESHOLD: float = 0.70
+WEIGHT_LOSS_THRESHOLD: float = 0.95
+
 app = FastAPI()
 
 
@@ -391,13 +396,13 @@ async def get_milk_production(db: DbDep) -> list[MilkProductionEntry]:
         List of entries with cow_id, cow_name, date and total_liters.
     """
     rows = db.execute(
-        """
+        f"""
         SELECT c.id, c.name, DATE(m.timestamp) AS production_date, SUM(m.value) AS total_liters
           FROM measurement m
           JOIN sensor s ON s.id = m.sensor_id
           JOIN cow    c ON c.id = m.cow_id
          WHERE s.unit = 'L'
-           AND m.timestamp >= datetime('now', '-30 days')
+           AND m.timestamp >= datetime('now', '-{HEALTH_WINDOW_DAYS} days')
          GROUP BY c.id, c.name, DATE(m.timestamp)
         """
     ).fetchall()
@@ -425,7 +430,7 @@ async def get_weights(db: DbDep) -> list[CowWeightSummary]:
         List with one entry per cow, ordered by name.
     """
     rows = db.execute(
-        """
+        f"""
         SELECT
             c.id,
             c.name,
@@ -443,7 +448,7 @@ async def get_weights(db: DbDep) -> list[CowWeightSummary]:
                   JOIN sensor s ON s.id = m.sensor_id
                  WHERE m.cow_id = c.id
                    AND s.unit = 'kg'
-                   AND m.timestamp >= datetime('now', '-30 days')
+                   AND m.timestamp >= datetime('now', '-{HEALTH_WINDOW_DAYS} days')
             ) AS avg_weight_30d_kg
           FROM cow c
          ORDER BY c.name
@@ -477,18 +482,18 @@ async def get_health(db: DbDep) -> list[IllCowEntry]:
     Returns:
         List of IllCowEntry for each cow with at least one active indicator.
     """
-    # Daily milk average in the last 3 days per cow
+    # Daily milk average in the last HEALTH_RECENT_DAYS days per cow
     milk_recent = {
         r[0]: r[1]
         for r in db.execute(
-            """
+            f"""
             SELECT cow_id, AVG(daily_total)
               FROM (
                     SELECT m.cow_id, DATE(m.timestamp) AS day, SUM(m.value) AS daily_total
                       FROM measurement m
                       JOIN sensor s ON s.id = m.sensor_id
                      WHERE s.unit = 'L'
-                       AND m.timestamp >= datetime('now', '-3 days')
+                       AND m.timestamp >= datetime('now', '-{HEALTH_RECENT_DAYS} days')
                      GROUP BY m.cow_id, day
                    )
              GROUP BY cow_id
@@ -496,19 +501,19 @@ async def get_health(db: DbDep) -> list[IllCowEntry]:
         ).fetchall()
     }
 
-    # Daily milk average in days 4-30 per cow (baseline)
+    # Daily milk average in days HEALTH_RECENT_DAYS+1 to HEALTH_WINDOW_DAYS per cow (baseline)
     milk_baseline = {
         r[0]: r[1]
         for r in db.execute(
-            """
+            f"""
             SELECT cow_id, AVG(daily_total)
               FROM (
                     SELECT m.cow_id, DATE(m.timestamp) AS day, SUM(m.value) AS daily_total
                       FROM measurement m
                       JOIN sensor s ON s.id = m.sensor_id
                      WHERE s.unit = 'L'
-                       AND m.timestamp >= datetime('now', '-30 days')
-                       AND m.timestamp <  datetime('now', '-3 days')
+                       AND m.timestamp >= datetime('now', '-{HEALTH_WINDOW_DAYS} days')
+                       AND m.timestamp <  datetime('now', '-{HEALTH_RECENT_DAYS} days')
                      GROUP BY m.cow_id, day
                    )
              GROUP BY cow_id
@@ -534,17 +539,17 @@ async def get_health(db: DbDep) -> list[IllCowEntry]:
         ).fetchall()
     }
 
-    # Weight average in days 4-30 per cow (baseline)
+    # Weight average in days HEALTH_RECENT_DAYS+1 to HEALTH_WINDOW_DAYS per cow (baseline)
     weight_baseline = {
         r[0]: r[1]
         for r in db.execute(
-            """
+            f"""
             SELECT m.cow_id, AVG(m.value)
               FROM measurement m
               JOIN sensor s ON s.id = m.sensor_id
              WHERE s.unit = 'kg'
-               AND m.timestamp >= datetime('now', '-30 days')
-               AND m.timestamp <  datetime('now', '-3 days')
+               AND m.timestamp >= datetime('now', '-{HEALTH_WINDOW_DAYS} days')
+               AND m.timestamp <  datetime('now', '-{HEALTH_RECENT_DAYS} days')
              GROUP BY m.cow_id
             """
         ).fetchall()
@@ -562,7 +567,7 @@ async def get_health(db: DbDep) -> list[IllCowEntry]:
         recent = milk_recent.get(cow_id)
         baseline = milk_baseline.get(cow_id)
         if recent is not None and baseline is not None and baseline > 0:
-            if recent < 0.70 * baseline:
+            if recent < MILK_DROP_THRESHOLD * baseline:
                 drop_pct = round((1 - recent / baseline) * 100)
                 reasons.append(
                     f"Milk production drop: recent avg {recent:.1f} L/day is "
@@ -572,11 +577,11 @@ async def get_health(db: DbDep) -> list[IllCowEntry]:
         current_w = weight_current.get(cow_id)
         base_w = weight_baseline.get(cow_id)
         if current_w is not None and base_w is not None and base_w > 0:
-            if current_w < 0.95 * base_w:
+            if current_w < WEIGHT_LOSS_THRESHOLD * base_w:
                 drop_pct = round((1 - current_w / base_w) * 100)
                 reasons.append(
                     f"Weight loss: current {current_w:.1f} kg is "
-                    f"{drop_pct}% below 30-day baseline {base_w:.1f} kg"
+                    f"{drop_pct}% below {HEALTH_WINDOW_DAYS}-day baseline {base_w:.1f} kg"
                 )
 
         if reasons:
