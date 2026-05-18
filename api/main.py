@@ -431,26 +431,38 @@ async def get_weights(db: DbDep) -> list[CowWeightSummary]:
     """
     rows = db.execute(
         f"""
-        SELECT
-            c.id,
-            c.name,
-            (
-                SELECT m.value
-                  FROM measurement m
-                  JOIN sensor s ON s.id = m.sensor_id
-                 WHERE m.cow_id = c.id AND s.unit = 'kg'
-                 ORDER BY m.timestamp DESC
-                 LIMIT 1
-            ) AS current_weight_kg,
-            (
-                SELECT AVG(m.value)
-                  FROM measurement m
-                  JOIN sensor s ON s.id = m.sensor_id
-                 WHERE m.cow_id = c.id
-                   AND s.unit = 'kg'
-                   AND m.timestamp >= datetime('now', '-{HEALTH_WINDOW_DAYS} days')
-            ) AS avg_weight_30d_kg
+        WITH kg_measurements AS (
+            -- Pre-filter to kg sensors once; avoids repeating the JOIN in every subquery.
+            SELECT m.cow_id, m.value, m.timestamp
+              FROM measurement m
+              JOIN sensor s ON s.id = m.sensor_id
+             WHERE s.unit = 'kg'
+        ),
+        ranked AS (
+            -- Number rows per cow newest-first to identify the current measurement.
+            SELECT cow_id,
+                   value,
+                   ROW_NUMBER() OVER (PARTITION BY cow_id ORDER BY timestamp DESC) AS rn
+              FROM kg_measurements
+        ),
+        current_weight AS (
+            SELECT cow_id, value AS current_weight_kg
+              FROM ranked
+             WHERE rn = 1
+        ),
+        avg_weight AS (
+            SELECT cow_id, AVG(value) AS avg_weight_30d_kg
+              FROM kg_measurements
+             WHERE timestamp >= datetime('now', '-{HEALTH_WINDOW_DAYS} days')
+             GROUP BY cow_id
+        )
+        SELECT c.id,
+               c.name,
+               cw.current_weight_kg,
+               aw.avg_weight_30d_kg
           FROM cow c
+          LEFT JOIN current_weight cw ON cw.cow_id = c.id
+          LEFT JOIN avg_weight     aw ON aw.cow_id = c.id
          ORDER BY c.name
         """
     ).fetchall()

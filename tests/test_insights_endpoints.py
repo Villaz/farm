@@ -215,6 +215,83 @@ class TestWeights:
         entry = next(e for e in body if e["cow_id"] == "cow-weight-loss")
         assert entry["current_weight_kg"] < entry["avg_weight_30d_kg"]
 
+    def test_results_ordered_by_cow_name(self, client: TestClient) -> None:
+        """La lista debe estar ordenada alfabéticamente por nombre de vaca."""
+        body = client.get("/insights/weights").json()
+        names = [e["cow_name"] for e in body]
+        assert names == sorted(names)
+
+    def test_weight_loss_cow_current_weight_is_latest_value(
+        self, client: TestClient
+    ) -> None:
+        """current_weight_kg debe ser el valor más reciente, no el más antiguo."""
+        body = client.get("/insights/weights").json()
+        entry = next(e for e in body if e["cow_id"] == "cow-weight-loss")
+        # La fixture inserta 510 kg durante días 4-30 y 450 kg en los últimos 3 días.
+        assert entry["current_weight_kg"] == pytest.approx(450.0)
+
+
+@pytest.fixture()
+def db_path_old_data(tmp_path: Path) -> Path:
+    """DB con una vaca que tiene mediciones dentro y fuera de la ventana de 30 días.
+
+    - cow-old: peso 600 kg hace 35 días (fuera de ventana), 400 kg en días 0-4 (dentro).
+      → current_weight_kg debe ser 400, avg_weight_30d_kg debe ser 400 (no 500).
+    """
+    path = tmp_path / "test_old.db"
+    create_schema(path)
+    con = sqlite3.connect(path)
+    con.execute("INSERT INTO cow VALUES ('cow-old', 'Old Data Cow', '2018-01-01')")
+    con.execute("INSERT INTO sensor VALUES ('sensor-weight', 'kg')")
+    # Medición fuera de la ventana de 30 días
+    ts_old = (datetime.utcnow() - timedelta(days=35)).strftime("%Y-%m-%d %H:%M:%S")
+    con.execute(
+        "INSERT INTO measurement VALUES ('sensor-weight','cow-old',?,600.0)", (ts_old,)
+    )
+    # Mediciones dentro de la ventana
+    for d in range(5):
+        ts = (datetime.utcnow() - timedelta(days=d)).strftime("%Y-%m-%d %H:%M:%S")
+        con.execute(
+            "INSERT INTO measurement VALUES ('sensor-weight','cow-old',?,400.0)", (ts,)
+        )
+    con.commit()
+    con.close()
+    return path
+
+
+class TestWeightsOldData:
+    """Verifica que la ventana de 30 días excluye mediciones antiguas."""
+
+    @pytest.fixture()
+    def client(self, db_path_old_data: Path) -> TestClient:
+        from api.main import app, get_db
+
+        def override():
+            con = sqlite3.connect(db_path_old_data, check_same_thread=False)
+            con.execute("PRAGMA foreign_keys = ON")
+            try:
+                yield con
+            finally:
+                con.close()
+
+        app.dependency_overrides[get_db] = override
+        yield TestClient(app)
+        app.dependency_overrides.clear()
+
+    def test_avg_excludes_measurements_older_than_30_days(
+        self, client: TestClient
+    ) -> None:
+        """La medición de día 35 (600 kg) no debe afectar al promedio de 30 días."""
+        body = client.get("/insights/weights").json()
+        entry = next(e for e in body if e["cow_id"] == "cow-old")
+        assert entry["avg_weight_30d_kg"] == pytest.approx(400.0)
+
+    def test_current_weight_is_400_not_600(self, client: TestClient) -> None:
+        """current_weight_kg debe ser el valor más reciente (400), no el antiguo (600)."""
+        body = client.get("/insights/weights").json()
+        entry = next(e for e in body if e["cow_id"] == "cow-old")
+        assert entry["current_weight_kg"] == pytest.approx(400.0)
+
 
 # ---------------------------------------------------------------------------
 # GET /insights/health
