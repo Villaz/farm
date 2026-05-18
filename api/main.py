@@ -595,9 +595,9 @@ async def get_health(db: DbDep) -> list[IllCowEntry]:
     milk_baseline = _fetch_milk_baseline(db)
     weight_current = _fetch_weight_current(db)
     weight_baseline = _fetch_weight_baseline(db)
-    cow_names = {r[0]: r[1] for r in db.execute("SELECT id, name FROM cow").fetchall()}
 
-    ill_cows: list[IllCowEntry] = []
+    # Assess health first; collect only cow_ids that are actually ill
+    ill_reasons: dict[str, list[str]] = {}
     for cow_id in set(milk_recent) | set(weight_current):
         reasons = [
             r for r in [
@@ -607,12 +607,25 @@ async def get_health(db: DbDep) -> list[IllCowEntry]:
             if r is not None
         ]
         if reasons:
-            ill_cows.append(IllCowEntry(
-                cow_id=cow_id,
-                cow_name=cow_names.get(cow_id, cow_id),
-                reasons=reasons,
-            ))
+            ill_reasons[cow_id] = reasons
 
+    if not ill_reasons:
+        return []
+
+    # Fetch names only for the ill cows, not the entire cow table
+    placeholders = ",".join("?" * len(ill_reasons))
+    cow_names = {
+        r[0]: r[1]
+        for r in db.execute(
+            f"SELECT id, name FROM cow WHERE id IN ({placeholders})",
+            list(ill_reasons),
+        ).fetchall()
+    }
+
+    ill_cows = [
+        IllCowEntry(cow_id=cow_id, cow_name=cow_names.get(cow_id, cow_id), reasons=reasons)
+        for cow_id, reasons in ill_reasons.items()
+    ]
     ill_cows.sort(key=lambda e: e.cow_name)
     return ill_cows
 
