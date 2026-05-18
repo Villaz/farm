@@ -34,6 +34,19 @@ CREATE TABLE IF NOT EXISTS measurement (
     FOREIGN KEY (sensor_id) REFERENCES sensor(id),
     FOREIGN KEY (cow_id)    REFERENCES cow(id)
 );
+
+-- Accelerates queries that filter/sort measurements by cow and time
+-- (e.g. latest measurement per cow, 30-day health windows).
+CREATE INDEX IF NOT EXISTS idx_measurement_cow_ts
+    ON measurement(cow_id, timestamp DESC);
+
+-- Accelerates JOINs between measurement and sensor when filtering by sensor.
+CREATE INDEX IF NOT EXISTS idx_measurement_sensor_ts
+    ON measurement(sensor_id, timestamp);
+
+-- Accelerates WHERE s.unit = 'L' / 'kg' filters present in every insight query.
+CREATE INDEX IF NOT EXISTS idx_sensor_unit
+    ON sensor(unit);
 """
 
 

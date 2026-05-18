@@ -189,6 +189,67 @@ class TestMeasurementSchema:
 
 
 # ---------------------------------------------------------------------------
+# Índices
+# ---------------------------------------------------------------------------
+
+
+class TestIndexes:
+    """Los índices de rendimiento deben existir tras llamar a init_db."""
+
+    def _index_names(self, db: sqlite3.Connection) -> set[str]:
+        return {
+            r[0]
+            for r in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            ).fetchall()
+        }
+
+    def test_idx_measurement_cow_ts_exists(self, db: sqlite3.Connection) -> None:
+        """Debe existir un índice sobre measurement(cow_id, timestamp)."""
+        assert "idx_measurement_cow_ts" in self._index_names(db)
+
+    def test_idx_measurement_sensor_ts_exists(self, db: sqlite3.Connection) -> None:
+        """Debe existir un índice sobre measurement(sensor_id, timestamp)."""
+        assert "idx_measurement_sensor_ts" in self._index_names(db)
+
+    def test_idx_sensor_unit_exists(self, db: sqlite3.Connection) -> None:
+        """Debe existir un índice sobre sensor(unit)."""
+        assert "idx_sensor_unit" in self._index_names(db)
+
+    def test_idx_measurement_cow_ts_covers_correct_table(
+        self, db: sqlite3.Connection
+    ) -> None:
+        """idx_measurement_cow_ts debe estar definido sobre la tabla measurement."""
+        row = db.execute(
+            "SELECT tbl_name FROM sqlite_master WHERE type='index' AND name='idx_measurement_cow_ts'"
+        ).fetchone()
+        assert row is not None and row[0] == "measurement"
+
+    def test_idx_measurement_sensor_ts_covers_correct_table(
+        self, db: sqlite3.Connection
+    ) -> None:
+        """idx_measurement_sensor_ts debe estar definido sobre la tabla measurement."""
+        row = db.execute(
+            "SELECT tbl_name FROM sqlite_master WHERE type='index' AND name='idx_measurement_sensor_ts'"
+        ).fetchone()
+        assert row is not None and row[0] == "measurement"
+
+    def test_idx_sensor_unit_covers_correct_table(
+        self, db: sqlite3.Connection
+    ) -> None:
+        """idx_sensor_unit debe estar definido sobre la tabla sensor."""
+        row = db.execute(
+            "SELECT tbl_name FROM sqlite_master WHERE type='index' AND name='idx_sensor_unit'"
+        ).fetchone()
+        assert row is not None and row[0] == "sensor"
+
+    def test_indexes_idempotent(self, db_path: Path) -> None:
+        """Llamar init_db dos veces no debe fallar por índices duplicados."""
+        init_db(db_path)
+        init_db(db_path)
+
+
+# ---------------------------------------------------------------------------
 # Idempotencia
 # ---------------------------------------------------------------------------
 
