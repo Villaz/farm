@@ -152,3 +152,27 @@ class TestCreateMeasurement:
         ts = con.execute("SELECT timestamp FROM measurement LIMIT 1").fetchone()[0]
         con.close()
         assert "2023-06-15" in ts
+
+    def test_empty_sensor_id_returns_422(self, client: TestClient) -> None:
+        """Un sensor_id vacío debe devolver HTTP 422."""
+        response = client.post("/measurements", json={**VALID_PAYLOAD, "sensor_id": ""})
+        assert response.status_code == 422
+
+    def test_sensor_id_too_long_returns_422(self, client: TestClient) -> None:
+        """Un sensor_id de más de 255 caracteres debe devolver HTTP 422."""
+        response = client.post(
+            "/measurements", json={**VALID_PAYLOAD, "sensor_id": "s" * 256}
+        )
+        assert response.status_code == 422
+
+    def test_empty_cow_id_returns_422(self, client: TestClient) -> None:
+        """Un cow_id vacío debe devolver HTTP 422."""
+        response = client.post("/measurements", json={**VALID_PAYLOAD, "cow_id": ""})
+        assert response.status_code == 422
+
+    def test_cow_id_too_long_returns_422(self, client: TestClient) -> None:
+        """Un cow_id de más de 255 caracteres debe devolver HTTP 422."""
+        response = client.post(
+            "/measurements", json={**VALID_PAYLOAD, "cow_id": "c" * 256}
+        )
+        assert response.status_code == 422

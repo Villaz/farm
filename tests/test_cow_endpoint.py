@@ -139,6 +139,30 @@ class TestCreateCow:
         con.close()
         assert count == 4  # 2 pre-populated + 2 new
 
+    def test_future_birthdate_returns_422(self, client: TestClient) -> None:
+        """A birthdate in the future must be rejected with HTTP 422."""
+        response = client.post(
+            "/cows/uuid-1",
+            json={"name": "Bessie #1", "birthdate": "2099-01-01"},
+        )
+        assert response.status_code == 422
+
+    def test_empty_name_returns_422(self, client: TestClient) -> None:
+        """An empty name must be rejected with HTTP 422."""
+        response = client.post(
+            "/cows/uuid-1",
+            json={"name": "", "birthdate": "2020-03-15"},
+        )
+        assert response.status_code == 422
+
+    def test_name_too_long_returns_422(self, client: TestClient) -> None:
+        """A name exceeding 255 characters must be rejected with HTTP 422."""
+        response = client.post(
+            "/cows/uuid-1",
+            json={"name": "A" * 256, "birthdate": "2020-03-15"},
+        )
+        assert response.status_code == 422
+
 
 # ---------------------------------------------------------------------------
 # GET /cows/{id}

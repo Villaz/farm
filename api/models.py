@@ -1,10 +1,14 @@
 """Pydantic models shared by API endpoints."""
 
 from datetime import date, datetime
+from typing import Annotated
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, StringConstraints, field_validator
 
 from api.validation import VALID_UNITS
+
+_Name = Annotated[str, StringConstraints(min_length=1, max_length=255)]
+_Id = Annotated[str, StringConstraints(min_length=1, max_length=255)]
 
 
 # ---------------------------------------------------------------------------
@@ -15,8 +19,16 @@ from api.validation import VALID_UNITS
 class CowCreate(BaseModel):
     """Fields required to create a new cow."""
 
-    name: str
+    name: _Name
     birthdate: date
+
+    @field_validator("birthdate")
+    @classmethod
+    def birthdate_not_in_future(cls, v: date) -> date:
+        """Reject birthdates that have not yet occurred."""
+        if v > date.today():
+            raise ValueError("birthdate cannot be in the future")
+        return v
 
 
 class CowResponse(BaseModel):
@@ -81,8 +93,8 @@ class SensorResponse(BaseModel):
 class MeasurementCreate(BaseModel):
     """Fields required to create a new measurement."""
 
-    sensor_id: str
-    cow_id: str
+    sensor_id: _Id
+    cow_id: _Id
     timestamp: datetime
     value: float
 
