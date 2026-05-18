@@ -466,24 +466,14 @@ async def get_weights(db: DbDep) -> list[CowWeightSummary]:
     ]
 
 
-@app.get("/insights/health", response_model=list[IllCowEntry])
-async def get_health(db: DbDep) -> list[IllCowEntry]:
-    """Detect potentially ill cows based on two indicators.
+# ---------------------------------------------------------------------------
+# Health helpers — data retrieval
+# ---------------------------------------------------------------------------
 
-    A cow is marked as potentially ill if it meets at least one of:
-    - Milk drop: the daily average of the last 3 days is below 70% of the daily
-      average of days 4-30 (requires data in both periods).
-    - Weight loss: current weight is below 95% of the weight average from days
-      4-30 (requires data in both periods).
 
-    Args:
-        db: Injected SQLite connection.
-
-    Returns:
-        List of IllCowEntry for each cow with at least one active indicator.
-    """
-    # Daily milk average in the last HEALTH_RECENT_DAYS days per cow
-    milk_recent = {
+def _fetch_milk_recent(db: sqlite3.Connection) -> dict[str, float]:
+    """Daily milk average per cow over the last HEALTH_RECENT_DAYS days."""
+    return {
         r[0]: r[1]
         for r in db.execute(
             f"""
@@ -501,8 +491,10 @@ async def get_health(db: DbDep) -> list[IllCowEntry]:
         ).fetchall()
     }
 
-    # Daily milk average in days HEALTH_RECENT_DAYS+1 to HEALTH_WINDOW_DAYS per cow (baseline)
-    milk_baseline = {
+
+def _fetch_milk_baseline(db: sqlite3.Connection) -> dict[str, float]:
+    """Daily milk average per cow for the baseline window (days HEALTH_RECENT_DAYS+1 to HEALTH_WINDOW_DAYS)."""
+    return {
         r[0]: r[1]
         for r in db.execute(
             f"""
@@ -521,8 +513,10 @@ async def get_health(db: DbDep) -> list[IllCowEntry]:
         ).fetchall()
     }
 
-    # Current weight (most recent measurement with kg unit) per cow
-    weight_current = {
+
+def _fetch_weight_current(db: sqlite3.Connection) -> dict[str, float]:
+    """Most recent weight measurement (kg) per cow."""
+    return {
         r[0]: r[1]
         for r in db.execute(
             """
@@ -539,8 +533,10 @@ async def get_health(db: DbDep) -> list[IllCowEntry]:
         ).fetchall()
     }
 
-    # Weight average in days HEALTH_RECENT_DAYS+1 to HEALTH_WINDOW_DAYS per cow (baseline)
-    weight_baseline = {
+
+def _fetch_weight_baseline(db: sqlite3.Connection) -> dict[str, float]:
+    """Average weight (kg) per cow for the baseline window (days HEALTH_RECENT_DAYS+1 to HEALTH_WINDOW_DAYS)."""
+    return {
         r[0]: r[1]
         for r in db.execute(
             f"""
@@ -555,43 +551,67 @@ async def get_health(db: DbDep) -> list[IllCowEntry]:
         ).fetchall()
     }
 
-    # Names of all cows
+
+# ---------------------------------------------------------------------------
+# Health helpers — business logic
+# ---------------------------------------------------------------------------
+
+
+def _assess_milk_health(recent: float | None, baseline: float | None) -> str | None:
+    """Return a health reason if milk production dropped below MILK_DROP_THRESHOLD, else None."""
+    if recent is None or baseline is None or baseline <= 0:
+        return None
+    if recent < MILK_DROP_THRESHOLD * baseline:
+        drop_pct = round((1 - recent / baseline) * 100)
+        return (
+            f"Milk production drop: recent avg {recent:.1f} L/day is "
+            f"{drop_pct}% below baseline {baseline:.1f} L/day"
+        )
+    return None
+
+
+def _assess_weight_health(current_w: float | None, base_w: float | None) -> str | None:
+    """Return a health reason if weight dropped below WEIGHT_LOSS_THRESHOLD, else None."""
+    if current_w is None or base_w is None or base_w <= 0:
+        return None
+    if current_w < WEIGHT_LOSS_THRESHOLD * base_w:
+        drop_pct = round((1 - current_w / base_w) * 100)
+        return (
+            f"Weight loss: current {current_w:.1f} kg is "
+            f"{drop_pct}% below {HEALTH_WINDOW_DAYS}-day baseline {base_w:.1f} kg"
+        )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Health endpoint
+# ---------------------------------------------------------------------------
+
+
+@app.get("/insights/health", response_model=list[IllCowEntry])
+async def get_health(db: DbDep) -> list[IllCowEntry]:
+    """Detect potentially ill cows based on milk drop and weight loss indicators."""
+    milk_recent = _fetch_milk_recent(db)
+    milk_baseline = _fetch_milk_baseline(db)
+    weight_current = _fetch_weight_current(db)
+    weight_baseline = _fetch_weight_baseline(db)
     cow_names = {r[0]: r[1] for r in db.execute("SELECT id, name FROM cow").fetchall()}
 
     ill_cows: list[IllCowEntry] = []
-    all_cow_ids = set(milk_recent) | set(weight_current)
-
-    for cow_id in all_cow_ids:
-        reasons: list[str] = []
-
-        recent = milk_recent.get(cow_id)
-        baseline = milk_baseline.get(cow_id)
-        if recent is not None and baseline is not None and baseline > 0:
-            if recent < MILK_DROP_THRESHOLD * baseline:
-                drop_pct = round((1 - recent / baseline) * 100)
-                reasons.append(
-                    f"Milk production drop: recent avg {recent:.1f} L/day is "
-                    f"{drop_pct}% below baseline {baseline:.1f} L/day"
-                )
-
-        current_w = weight_current.get(cow_id)
-        base_w = weight_baseline.get(cow_id)
-        if current_w is not None and base_w is not None and base_w > 0:
-            if current_w < WEIGHT_LOSS_THRESHOLD * base_w:
-                drop_pct = round((1 - current_w / base_w) * 100)
-                reasons.append(
-                    f"Weight loss: current {current_w:.1f} kg is "
-                    f"{drop_pct}% below {HEALTH_WINDOW_DAYS}-day baseline {base_w:.1f} kg"
-                )
-
+    for cow_id in set(milk_recent) | set(weight_current):
+        reasons = [
+            r for r in [
+                _assess_milk_health(milk_recent.get(cow_id), milk_baseline.get(cow_id)),
+                _assess_weight_health(weight_current.get(cow_id), weight_baseline.get(cow_id)),
+            ]
+            if r is not None
+        ]
         if reasons:
-            ill_cows.append(
-                IllCowEntry(
-                    cow_id=cow_id,
-                    cow_name=cow_names.get(cow_id, cow_id),
-                    reasons=reasons,
-                )
-            )
+            ill_cows.append(IllCowEntry(
+                cow_id=cow_id,
+                cow_name=cow_names.get(cow_id, cow_id),
+                reasons=reasons,
+            ))
 
     ill_cows.sort(key=lambda e: e.cow_name)
     return ill_cows
