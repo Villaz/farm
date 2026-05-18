@@ -350,3 +350,122 @@ class TestHealth:
         for entry in body:
             assert isinstance(entry["reasons"], list)
             assert len(entry["reasons"]) >= 1
+
+    def test_cow_with_no_data_not_in_response(self, client: TestClient) -> None:
+        """cow-no-data no tiene mediciones; no debe aparecer en el resultado."""
+        body = client.get("/insights/health").json()
+        flagged = {e["cow_id"] for e in body}
+        assert "cow-no-data" not in flagged
+
+    def test_results_ordered_by_cow_name(self, client: TestClient) -> None:
+        """El resultado debe estar ordenado alfabéticamente por nombre de vaca."""
+        body = client.get("/insights/health").json()
+        names = [e["cow_name"] for e in body]
+        assert names == sorted(names)
+
+    def test_cow_name_is_included_in_response(self, client: TestClient) -> None:
+        """cow_name debe ser el nombre real, no el id."""
+        body = client.get("/insights/health").json()
+        entry = next(e for e in body if e["cow_id"] == "cow-milk-drop")
+        assert entry["cow_name"] == "Milk Drop Cow"
+
+
+@pytest.fixture()
+def db_path_health_edge(tmp_path: Path) -> Path:
+    """DB con vacas que tienen solo un tipo de medición (peso O leche, no ambas).
+
+    - cow-weight-only: pierde >5% peso en últimos 3 días, sin mediciones de leche.
+    - cow-milk-only:   cae >30% leche en últimos 3 días, sin mediciones de peso.
+    - cow-both-issues: cae leche Y pierde peso simultáneamente.
+    """
+    path = tmp_path / "health_edge.db"
+    create_schema(path)
+    con = sqlite3.connect(path)
+
+    for cid, name in [
+        ("cow-weight-only", "Weight Only Cow"),
+        ("cow-milk-only", "Milk Only Cow"),
+        ("cow-both-issues", "Both Issues Cow"),
+    ]:
+        con.execute(f"INSERT INTO cow VALUES ('{cid}', '{name}', '2020-01-01')")
+
+    con.execute("INSERT INTO sensor VALUES ('s-milk', 'L')")
+    con.execute("INSERT INTO sensor VALUES ('s-weight', 'kg')")
+
+    # cow-weight-only: 500 kg baseline (días 4-30), 400 kg reciente (días 0-2)
+    for d in range(4, 30):
+        ts = _ts(d)
+        con.execute("INSERT INTO measurement VALUES ('s-weight','cow-weight-only',?,500.0)", (ts,))
+    for d in range(3):
+        ts = _ts(d)
+        con.execute("INSERT INTO measurement VALUES ('s-weight','cow-weight-only',?,400.0)", (ts,))
+
+    # cow-milk-only: 20 L/day baseline (días 4-30), 5 L/day reciente (días 0-2)
+    for d in range(4, 30):
+        ts = _ts(d)
+        con.execute("INSERT INTO measurement VALUES ('s-milk','cow-milk-only',?,20.0)", (ts,))
+    for d in range(3):
+        ts = _ts(d)
+        con.execute("INSERT INTO measurement VALUES ('s-milk','cow-milk-only',?,5.0)", (ts,))
+
+    # cow-both-issues: ambas caídas
+    for d in range(4, 30):
+        ts = _ts(d)
+        con.execute("INSERT INTO measurement VALUES ('s-milk','cow-both-issues',?,20.0)", (ts,))
+        con.execute("INSERT INTO measurement VALUES ('s-weight','cow-both-issues',?,500.0)", (ts,))
+    for d in range(3):
+        ts = _ts(d)
+        con.execute("INSERT INTO measurement VALUES ('s-milk','cow-both-issues',?,5.0)", (ts,))
+        con.execute("INSERT INTO measurement VALUES ('s-weight','cow-both-issues',?,400.0)", (ts,))
+
+    con.commit()
+    con.close()
+    return path
+
+
+class TestHealthEdgeCases:
+    """Casos de borde: vaca con solo peso, solo leche, o ambas alertas."""
+
+    @pytest.fixture()
+    def client(self, db_path_health_edge: Path) -> TestClient:
+        from api.main import app, get_db
+
+        def override():
+            con = sqlite3.connect(db_path_health_edge, check_same_thread=False)
+            con.execute("PRAGMA foreign_keys = ON")
+            try:
+                yield con
+            finally:
+                con.close()
+
+        app.dependency_overrides[get_db] = override
+        yield TestClient(app)
+        app.dependency_overrides.clear()
+
+    def test_weight_only_cow_is_flagged(self, client: TestClient) -> None:
+        body = client.get("/insights/health").json()
+        flagged = {e["cow_id"] for e in body}
+        assert "cow-weight-only" in flagged
+
+    def test_weight_only_cow_has_no_milk_reason(self, client: TestClient) -> None:
+        """Sin mediciones de leche no debe aparecer razón de milk drop."""
+        body = client.get("/insights/health").json()
+        entry = next(e for e in body if e["cow_id"] == "cow-weight-only")
+        assert not any("milk" in r.lower() for r in entry["reasons"])
+
+    def test_milk_only_cow_is_flagged(self, client: TestClient) -> None:
+        body = client.get("/insights/health").json()
+        flagged = {e["cow_id"] for e in body}
+        assert "cow-milk-only" in flagged
+
+    def test_milk_only_cow_has_no_weight_reason(self, client: TestClient) -> None:
+        """Sin mediciones de peso no debe aparecer razón de weight loss."""
+        body = client.get("/insights/health").json()
+        entry = next(e for e in body if e["cow_id"] == "cow-milk-only")
+        assert not any("weight" in r.lower() for r in entry["reasons"])
+
+    def test_both_issues_cow_has_two_reasons(self, client: TestClient) -> None:
+        """Una vaca con caída de leche Y peso debe tener dos razones."""
+        body = client.get("/insights/health").json()
+        entry = next(e for e in body if e["cow_id"] == "cow-both-issues")
+        assert len(entry["reasons"]) == 2

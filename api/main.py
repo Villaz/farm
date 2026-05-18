@@ -479,92 +479,6 @@ async def get_weights(db: DbDep) -> list[CowWeightSummary]:
 
 
 # ---------------------------------------------------------------------------
-# Health helpers — data retrieval
-# ---------------------------------------------------------------------------
-
-
-def _fetch_milk_recent(db: sqlite3.Connection) -> dict[str, float]:
-    """Daily milk average per cow over the last HEALTH_RECENT_DAYS days."""
-    return {
-        r[0]: r[1]
-        for r in db.execute(
-            f"""
-            SELECT cow_id, AVG(daily_total)
-              FROM (
-                    SELECT m.cow_id, DATE(m.timestamp) AS day, SUM(m.value) AS daily_total
-                      FROM measurement m
-                      JOIN sensor s ON s.id = m.sensor_id
-                     WHERE s.unit = 'L'
-                       AND m.timestamp >= datetime('now', '-{HEALTH_RECENT_DAYS} days')
-                     GROUP BY m.cow_id, day
-                   )
-             GROUP BY cow_id
-            """
-        ).fetchall()
-    }
-
-
-def _fetch_milk_baseline(db: sqlite3.Connection) -> dict[str, float]:
-    """Daily milk average per cow for the baseline window (days HEALTH_RECENT_DAYS+1 to HEALTH_WINDOW_DAYS)."""
-    return {
-        r[0]: r[1]
-        for r in db.execute(
-            f"""
-            SELECT cow_id, AVG(daily_total)
-              FROM (
-                    SELECT m.cow_id, DATE(m.timestamp) AS day, SUM(m.value) AS daily_total
-                      FROM measurement m
-                      JOIN sensor s ON s.id = m.sensor_id
-                     WHERE s.unit = 'L'
-                       AND m.timestamp >= datetime('now', '-{HEALTH_WINDOW_DAYS} days')
-                       AND m.timestamp <  datetime('now', '-{HEALTH_RECENT_DAYS} days')
-                     GROUP BY m.cow_id, day
-                   )
-             GROUP BY cow_id
-            """
-        ).fetchall()
-    }
-
-
-def _fetch_weight_current(db: sqlite3.Connection) -> dict[str, float]:
-    """Most recent weight measurement (kg) per cow."""
-    return {
-        r[0]: r[1]
-        for r in db.execute(
-            """
-            SELECT cow_id, value
-              FROM (
-                    SELECT m.cow_id, m.value,
-                           ROW_NUMBER() OVER (PARTITION BY m.cow_id ORDER BY m.timestamp DESC) AS rn
-                      FROM measurement m
-                      JOIN sensor s ON s.id = m.sensor_id
-                     WHERE s.unit = 'kg'
-                   )
-             WHERE rn = 1
-            """
-        ).fetchall()
-    }
-
-
-def _fetch_weight_baseline(db: sqlite3.Connection) -> dict[str, float]:
-    """Average weight (kg) per cow for the baseline window (days HEALTH_RECENT_DAYS+1 to HEALTH_WINDOW_DAYS)."""
-    return {
-        r[0]: r[1]
-        for r in db.execute(
-            f"""
-            SELECT m.cow_id, AVG(m.value)
-              FROM measurement m
-              JOIN sensor s ON s.id = m.sensor_id
-             WHERE s.unit = 'kg'
-               AND m.timestamp >= datetime('now', '-{HEALTH_WINDOW_DAYS} days')
-               AND m.timestamp <  datetime('now', '-{HEALTH_RECENT_DAYS} days')
-             GROUP BY m.cow_id
-            """
-        ).fetchall()
-    }
-
-
-# ---------------------------------------------------------------------------
 # Health helpers — business logic
 # ---------------------------------------------------------------------------
 
@@ -603,42 +517,81 @@ def _assess_weight_health(current_w: float | None, base_w: float | None) -> str 
 @app.get("/insights/health", response_model=list[IllCowEntry])
 async def get_health(db: DbDep) -> list[IllCowEntry]:
     """Detect potentially ill cows based on milk drop and weight loss indicators."""
-    milk_recent = _fetch_milk_recent(db)
-    milk_baseline = _fetch_milk_baseline(db)
-    weight_current = _fetch_weight_current(db)
-    weight_baseline = _fetch_weight_baseline(db)
+    rows = db.execute(
+        f"""
+        WITH daily_milk AS (
+            -- Daily milk totals per cow within the full analysis window.
+            SELECT m.cow_id,
+                   DATE(m.timestamp) AS day,
+                   SUM(m.value)      AS daily_total
+              FROM measurement m
+              JOIN sensor s ON s.id = m.sensor_id
+             WHERE s.unit = 'L'
+               AND m.timestamp >= datetime('now', '-{HEALTH_WINDOW_DAYS} days')
+             GROUP BY m.cow_id, day
+        ),
+        milk_recent AS (
+            SELECT cow_id, AVG(daily_total) AS avg_daily
+              FROM daily_milk
+             WHERE day >= DATE('now', '-{HEALTH_RECENT_DAYS} days')
+             GROUP BY cow_id
+        ),
+        milk_baseline AS (
+            SELECT cow_id, AVG(daily_total) AS avg_daily
+              FROM daily_milk
+             WHERE day < DATE('now', '-{HEALTH_RECENT_DAYS} days')
+             GROUP BY cow_id
+        ),
+        kg_ranked AS (
+            SELECT m.cow_id,
+                   m.value,
+                   ROW_NUMBER() OVER (PARTITION BY m.cow_id ORDER BY m.timestamp DESC) AS rn
+              FROM measurement m
+              JOIN sensor s ON s.id = m.sensor_id
+             WHERE s.unit = 'kg'
+        ),
+        weight_current AS (
+            SELECT cow_id, value AS current_kg
+              FROM kg_ranked
+             WHERE rn = 1
+        ),
+        weight_baseline AS (
+            SELECT m.cow_id, AVG(m.value) AS avg_kg
+              FROM measurement m
+              JOIN sensor s ON s.id = m.sensor_id
+             WHERE s.unit = 'kg'
+               AND m.timestamp >= datetime('now', '-{HEALTH_WINDOW_DAYS} days')
+               AND m.timestamp <  datetime('now', '-{HEALTH_RECENT_DAYS} days')
+             GROUP BY m.cow_id
+        )
+        SELECT c.id,
+               c.name,
+               mr.avg_daily  AS milk_recent,
+               mb.avg_daily  AS milk_baseline,
+               wc.current_kg AS weight_current,
+               wb.avg_kg     AS weight_baseline
+          FROM cow c
+          LEFT JOIN milk_recent    mr ON mr.cow_id = c.id
+          LEFT JOIN milk_baseline  mb ON mb.cow_id = c.id
+          LEFT JOIN weight_current wc ON wc.cow_id = c.id
+          LEFT JOIN weight_baseline wb ON wb.cow_id = c.id
+         WHERE mr.cow_id IS NOT NULL OR wc.cow_id IS NOT NULL
+         ORDER BY c.name
+        """
+    ).fetchall()
 
-    # Assess health first; collect only cow_ids that are actually ill
-    ill_reasons: dict[str, list[str]] = {}
-    for cow_id in set(milk_recent) | set(weight_current):
+    ill_cows: list[IllCowEntry] = []
+    for cow_id, cow_name, milk_rec, milk_base, weight_cur, weight_base in rows:
         reasons = [
             r for r in [
-                _assess_milk_health(milk_recent.get(cow_id), milk_baseline.get(cow_id)),
-                _assess_weight_health(weight_current.get(cow_id), weight_baseline.get(cow_id)),
+                _assess_milk_health(milk_rec, milk_base),
+                _assess_weight_health(weight_cur, weight_base),
             ]
             if r is not None
         ]
         if reasons:
-            ill_reasons[cow_id] = reasons
+            ill_cows.append(IllCowEntry(cow_id=cow_id, cow_name=cow_name, reasons=reasons))
 
-    if not ill_reasons:
-        return []
-
-    # Fetch names only for the ill cows, not the entire cow table
-    placeholders = ",".join("?" * len(ill_reasons))
-    cow_names = {
-        r[0]: r[1]
-        for r in db.execute(
-            f"SELECT id, name FROM cow WHERE id IN ({placeholders})",
-            list(ill_reasons),
-        ).fetchall()
-    }
-
-    ill_cows = [
-        IllCowEntry(cow_id=cow_id, cow_name=cow_names.get(cow_id, cow_id), reasons=reasons)
-        for cow_id, reasons in ill_reasons.items()
-    ]
-    ill_cows.sort(key=lambda e: e.cow_name)
     return ill_cows
 
 
